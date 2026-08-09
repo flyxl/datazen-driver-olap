@@ -22,6 +22,7 @@ export const prestoMeta: DatabaseTypeMeta = {
   databaseFieldType: 'name',
   hasMultiDatabase: true,
   connectionForm: 'catalog',
+  connectionIncludesSchema: true,
 };
 
 export const trinoMeta: DatabaseTypeMeta = {
@@ -46,4 +47,5 @@ export const trinoMeta: DatabaseTypeMeta = {
   databaseFieldType: 'name',
   hasMultiDatabase: true,
   connectionForm: 'catalog',
+  connectionIncludesSchema: true,
 };
