@@ -657,6 +657,9 @@ impl DatabaseDriverFactory for TrinoDriverFactory {
 datazen_driver_api::register_driver!(&PrestoDriverFactory);
 datazen_driver_api::register_driver!(&TrinoDriverFactory);
 
+mod sync_adapter;
+pub use sync_adapter::TrinoSyncAdapter;
+
 #[cfg(test)]
 mod tests {
     use super::*;
