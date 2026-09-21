@@ -6,7 +6,7 @@ use prusto::Client as PrestoClient;
 use prusto::Presto as _;
 use prusto::Row as PrestoRow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use trino_rust_client::auth::Auth as TrinoAuth;
@@ -26,7 +26,6 @@ enum OlapClient {
 struct OlapSession {
     client: OlapClient,
     catalog: String,
-    active_schema: Mutex<String>,
 }
 
 pub struct OlapDriver {
@@ -113,7 +112,10 @@ impl OlapDriver {
         }
     }
 
-    fn build_client(config: &ConnectionConfig, db_type: DatabaseType) -> Result<OlapClient, DriverError> {
+    fn build_client(
+        config: &ConnectionConfig,
+        db_type: DatabaseType,
+    ) -> Result<OlapClient, DriverError> {
         let host = Self::host(config)?;
         let port = Self::port(config);
         let user = Self::username(config);
@@ -178,18 +180,12 @@ impl OlapDriver {
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Option<Value>>>), DriverError> {
         match client {
             OlapClient::Presto(c) => {
-                let ds = c
-                    .get_all::<PrestoRow>(sql)
-                    .await
-                    .map_err(map_presto_err)?;
+                let ds = c.get_all::<PrestoRow>(sql).await.map_err(map_presto_err)?;
                 let (types, data) = ds.split();
                 Ok(dataset_to_result(&types, &data))
             }
             OlapClient::Trino(c) => {
-                let ds = c
-                    .get_all::<TrinoRow>(sql)
-                    .await
-                    .map_err(map_trino_err)?;
+                let ds = c.get_all::<TrinoRow>(sql).await.map_err(map_trino_err)?;
                 let (types, data) = ds.split();
                 Ok(dataset_to_result(&types, &data))
             }
@@ -207,10 +203,6 @@ impl OlapDriver {
             Self::quote(schema),
             Self::quote(table)
         )
-    }
-
-    fn set_active_schema(session: &OlapSession, schema: &str) {
-        *session.active_schema.lock().unwrap() = schema.to_string();
     }
 }
 
@@ -254,7 +246,10 @@ fn json_to_value(v: &serde_json::Value) -> Option<Value> {
     }
 }
 
-fn dataset_to_result<T>(types: &[(String, impl std::fmt::Debug)], rows: &[T]) -> (Vec<ColumnInfo>, Vec<Vec<Option<Value>>>)
+fn dataset_to_result<T>(
+    types: &[(String, impl std::fmt::Debug)],
+    rows: &[T],
+) -> (Vec<ColumnInfo>, Vec<Vec<Option<Value>>>)
 where
     T: RowValues,
 {
@@ -297,6 +292,11 @@ impl DatabaseDriver for OlapDriver {
         self.db_type.clone()
     }
 
+    // `has_schema_level()` intentionally stays at its default `false`: in this
+    // driver's model the `database` argument already carries the Presto/Trino
+    // *schema* (`WHERE table_catalog = <catalog> AND table_schema = <database>`)
+    // and the frontend passes it that way. Declaring a real schema level would
+    // force a second namespace dimension through the whole stack for no gain.
     fn skip_count_query(&self) -> bool {
         true
     }
@@ -308,18 +308,13 @@ impl DatabaseDriver for OlapDriver {
     async fn connect(&self, config: &ConnectionConfig) -> Result<ConnectionHandle, DriverError> {
         let client = Self::build_client(config, self.db_type.clone())?;
         let catalog = Self::catalog(config)?;
-        let schema = Self::default_schema(config);
         let pool_id = uuid::Uuid::new_v4().to_string();
         let connection_id = uuid::Uuid::new_v4().to_string();
 
-        self.sessions.write().await.insert(
-            pool_id.clone(),
-            OlapSession {
-                client,
-                catalog,
-                active_schema: Mutex::new(schema),
-            },
-        );
+        self.sessions
+            .write()
+            .await
+            .insert(pool_id.clone(), OlapSession { client, catalog });
 
         Ok(ConnectionHandle {
             id: connection_id,
@@ -397,10 +392,11 @@ impl DatabaseDriver for OlapDriver {
         &self,
         handle: &ConnectionHandle,
         database: &str,
+        schema: Option<&str>,
     ) -> Result<Vec<TableInfo>, DriverError> {
+        validate_schema_target(self, database, schema, SchemaScope::AnySchema)?;
         let sessions = self.sessions.read().await;
         let s = Self::get_session(&sessions, handle)?;
-        Self::set_active_schema(s, database);
 
         let sql = format!(
             "SELECT table_name, table_type FROM information_schema.tables \
@@ -419,10 +415,14 @@ impl DatabaseDriver for OlapDriver {
                     Value::String(s) => s.clone(),
                     other => format!("{other:?}"),
                 };
-                let table_type = r.get(1).and_then(|v| v.as_ref()).map(|v| match v {
-                    Value::String(s) if s.eq_ignore_ascii_case("VIEW") => TableType::View,
-                    _ => TableType::Table,
-                }).unwrap_or(TableType::Table);
+                let table_type = r
+                    .get(1)
+                    .and_then(|v| v.as_ref())
+                    .map(|v| match v {
+                        Value::String(s) if s.eq_ignore_ascii_case("VIEW") => TableType::View,
+                        _ => TableType::Table,
+                    })
+                    .unwrap_or(TableType::Table);
                 Some(TableInfo {
                     name,
                     schema: Some(database.to_string()),
@@ -437,13 +437,17 @@ impl DatabaseDriver for OlapDriver {
         &self,
         handle: &ConnectionHandle,
         table: &str,
+        database: &str,
+        schema: Option<&str>,
     ) -> Result<TableSchema, DriverError> {
-        let (columns, primary_keys) = self.get_columns(handle, table).await?;
+        validate_schema_target(self, database, schema, SchemaScope::ExactSchema)?;
+        // `database` is the Presto schema here, so it is threaded straight
+        // through; no session `active_schema` is read or written.
+        let (columns, primary_keys) = self.get_columns(handle, table, database, None).await?;
         let sessions = self.sessions.read().await;
         let s = Self::get_session(&sessions, handle)?;
-        let schema = s.active_schema.lock().unwrap().clone();
         Ok(TableSchema {
-            table_name: Self::qualified_table(&s.catalog, &schema, table),
+            table_name: Self::qualified_table(&s.catalog, database, table),
             columns,
             primary_keys,
             indexes: Vec::new(),
@@ -455,11 +459,13 @@ impl DatabaseDriver for OlapDriver {
         &self,
         handle: &ConnectionHandle,
         table: &str,
+        database: &str,
+        schema: Option<&str>,
     ) -> Result<(Vec<ColumnSchema>, Vec<String>), DriverError> {
+        validate_schema_target(self, database, schema, SchemaScope::ExactSchema)?;
         let sessions = self.sessions.read().await;
         let s = Self::get_session(&sessions, handle)?;
-        let schema = s.active_schema.lock().unwrap().clone();
-        let qualified = Self::qualified_table(&s.catalog, &schema, table);
+        let qualified = Self::qualified_table(&s.catalog, database, table);
         let sql = format!("DESCRIBE {qualified}");
 
         let (_, rows) = Self::run_query(&s.client, sql).await?;
@@ -497,7 +503,11 @@ impl DatabaseDriver for OlapDriver {
         Ok((columns, Vec::new()))
     }
 
-    async fn query(&self, handle: &ConnectionHandle, sql: &str) -> Result<QueryResult, DriverError> {
+    async fn query(
+        &self,
+        handle: &ConnectionHandle,
+        sql: &str,
+    ) -> Result<QueryResult, DriverError> {
         let start = Instant::now();
         let sessions = self.sessions.read().await;
         let s = Self::get_session(&sessions, handle)?;
@@ -527,7 +537,9 @@ impl DatabaseDriver for OlapDriver {
         for stmt in statements {
             let start = Instant::now();
             let limited = if let Some(lim) = limit {
-                if stmt.to_uppercase().starts_with("SELECT") && !stmt.to_uppercase().contains("LIMIT") {
+                if stmt.to_uppercase().starts_with("SELECT")
+                    && !stmt.to_uppercase().contains("LIMIT")
+                {
                     format!("{stmt} LIMIT {lim}")
                 } else {
                     stmt.to_string()
@@ -573,22 +585,21 @@ impl DatabaseDriver for OlapDriver {
         let s = Self::get_session(&sessions, handle)?;
         match &s.client {
             OlapClient::Presto(c) => {
-                c.execute(sql.to_string())
-                    .await
-                    .map_err(map_presto_err)?;
+                c.execute(sql.to_string()).await.map_err(map_presto_err)?;
             }
             OlapClient::Trino(c) => {
-                let res = c
-                    .execute(sql.to_string())
-                    .await
-                    .map_err(map_trino_err)?;
+                let res = c.execute(sql.to_string()).await.map_err(map_trino_err)?;
                 return Ok(res.update_count.unwrap_or(0));
             }
         }
         Ok(0)
     }
 
-    async fn explain(&self, handle: &ConnectionHandle, sql: &str) -> Result<ExplainResult, DriverError> {
+    async fn explain(
+        &self,
+        handle: &ConnectionHandle,
+        sql: &str,
+    ) -> Result<ExplainResult, DriverError> {
         let explain_sql = if sql.trim().to_uppercase().starts_with("EXPLAIN") {
             sql.to_string()
         } else {
@@ -609,20 +620,10 @@ impl DatabaseDriver for OlapDriver {
         Ok(ExplainResult {
             plan_text,
             plan_json: None,
+            plan_tree: None,
             total_cost: None,
             estimated_rows: None,
         })
-    }
-
-    async fn use_database(
-        &self,
-        handle: &ConnectionHandle,
-        database: &str,
-    ) -> Result<(), DriverError> {
-        let sessions = self.sessions.read().await;
-        let s = Self::get_session(&sessions, handle)?;
-        Self::set_active_schema(s, database);
-        Ok(())
     }
 
     async fn cancel_query(&self, _handle: &ConnectionHandle) -> Result<(), DriverError> {
@@ -679,6 +680,24 @@ mod tests {
             json_to_value(&serde_json::json!("hello")),
             Some(Value::String(s)) if s == "hello"
         ));
+    }
+
+    #[test]
+    fn olap_has_no_schema_level_and_rejects_a_schema_argument() {
+        let driver = OlapDriver::new("presto".to_string());
+        assert!(!driver.has_schema_level());
+        // `database` carries the Presto schema in this driver's model.
+        assert!(validate_schema_target(&driver, "hive", None, SchemaScope::ExactSchema).is_ok());
+        assert!(validate_schema_target(&driver, "hive", None, SchemaScope::AnySchema).is_ok());
+        assert!(
+            validate_schema_target(&driver, "hive", Some("default"), SchemaScope::ExactSchema)
+                .is_err(),
+            "a schema-less driver must reject a schema argument"
+        );
+        assert!(
+            validate_schema_target(&driver, "hive", Some("default"), SchemaScope::AnySchema)
+                .is_err()
+        );
     }
 
     #[test]
