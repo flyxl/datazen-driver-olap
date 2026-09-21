@@ -1,4 +1,4 @@
-import type { SqlDialectStrategy } from '@datazen/plugin-sdk';
+import type { SqlDialectStrategy } from '@datazen/driver-sdk';
 
 export const trinoDialect: SqlDialectStrategy = {
   family: 'trino',

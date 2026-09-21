@@ -1,5 +1,5 @@
-import { Input, Label, useI18n } from '@datazen/plugin-sdk';
-import type { ConnectionFormState } from '@datazen/plugin-sdk';
+import { Input, Label, useI18n } from '@datazen/ui';
+import type { ConnectionFormState } from '@datazen/driver-sdk';
 
 export interface CatalogConnectionFieldsProps {
   form: ConnectionFormState;
