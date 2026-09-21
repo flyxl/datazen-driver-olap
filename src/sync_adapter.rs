@@ -32,8 +32,14 @@ fn parse_precision(s: &str, prefix: &str) -> (u8, u8) {
         let rest = rest.trim();
         if let Some(inner) = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
             let parts: Vec<&str> = inner.split(',').collect();
-            let p = parts.first().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-            let s = parts.get(1).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+            let p = parts
+                .first()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let s = parts
+                .get(1)
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
             return (p, s);
         }
     }
@@ -43,11 +49,7 @@ fn parse_precision(s: &str, prefix: &str) -> (u8, u8) {
 // ── SyncSourceAdapter ──────────────────────────────────────────────
 
 impl SyncSourceAdapter for TrinoSyncAdapter {
-    fn column_to_ir(
-        &self,
-        column: &ColumnSchema,
-        native_full_type: Option<&str>,
-    ) -> IRColumn {
+    fn column_to_ir(&self, column: &ColumnSchema, native_full_type: Option<&str>) -> IRColumn {
         let raw = native_full_type.unwrap_or(&column.data_type);
         let lower = raw.trim().to_lowercase();
 
@@ -59,14 +61,18 @@ impl SyncSourceAdapter for TrinoSyncAdapter {
             IRType::Char { length: len }
         } else if lower.starts_with("decimal") {
             let (p, s) = parse_precision(&lower, "decimal");
-            IRType::Decimal { precision: p, scale: s }
+            IRType::Decimal {
+                precision: p,
+                scale: s,
+            }
         } else if lower.starts_with("timestamp") {
             let tz = lower.contains("with time zone");
             IRType::Timestamp { with_timezone: tz }
         } else if lower.starts_with("time") {
             let tz = lower.contains("with time zone");
             IRType::Time { with_timezone: tz }
-        } else if lower.starts_with("array") || lower.starts_with("map") || lower.starts_with("row") {
+        } else if lower.starts_with("array") || lower.starts_with("map") || lower.starts_with("row")
+        {
             IRType::Json
         } else {
             match lower.as_str() {
@@ -116,10 +122,18 @@ impl SyncTargetAdapter for TrinoSyncAdapter {
             IRType::Varchar { length: None } | IRType::Text => "varchar".into(),
             IRType::Binary { .. } | IRType::Blob => "varbinary".into(),
             IRType::Date => "date".into(),
-            IRType::Time { with_timezone: false } => "time".into(),
-            IRType::Time { with_timezone: true } => "time with time zone".into(),
-            IRType::Timestamp { with_timezone: false } => "timestamp".into(),
-            IRType::Timestamp { with_timezone: true } => "timestamp with time zone".into(),
+            IRType::Time {
+                with_timezone: false,
+            } => "time".into(),
+            IRType::Time {
+                with_timezone: true,
+            } => "time with time zone".into(),
+            IRType::Timestamp {
+                with_timezone: false,
+            } => "timestamp".into(),
+            IRType::Timestamp {
+                with_timezone: true,
+            } => "timestamp with time zone".into(),
             IRType::Json => "json".into(),
             IRType::Uuid => "uuid".into(),
             IRType::Bit { .. } => "boolean".into(),
@@ -144,7 +158,9 @@ impl SyncTargetAdapter for TrinoSyncAdapter {
             Some(Value::Bytes(b)) => {
                 format!(
                     "X'{}'",
-                    b.iter().map(|byte| format!("{:02x}", byte)).collect::<String>()
+                    b.iter()
+                        .map(|byte| format!("{:02x}", byte))
+                        .collect::<String>()
                 )
             }
         }
@@ -197,9 +213,13 @@ mod tests {
 
     #[test]
     fn trino_timestamp_with_tz() {
-        let ir = TrinoSyncAdapter
-            .column_to_ir(&col("ts", "timestamp(3) with time zone"), None);
-        assert_eq!(ir.ir_type, IRType::Timestamp { with_timezone: true });
+        let ir = TrinoSyncAdapter.column_to_ir(&col("ts", "timestamp(3) with time zone"), None);
+        assert_eq!(
+            ir.ir_type,
+            IRType::Timestamp {
+                with_timezone: true
+            }
+        );
     }
 
     #[test]
@@ -215,7 +235,10 @@ mod tests {
         assert_eq!(a.ir_type_to_native(&IRType::Uuid), "uuid");
         assert_eq!(a.ir_type_to_native(&IRType::Bool), "boolean");
         assert_eq!(
-            a.ir_type_to_native(&IRType::Decimal { precision: 10, scale: 2 }),
+            a.ir_type_to_native(&IRType::Decimal {
+                precision: 10,
+                scale: 2
+            }),
             "decimal(10,2)"
         );
     }
@@ -233,9 +256,20 @@ mod tests {
         let ir = TrinoSyncAdapter.column_to_ir(&col("c", "char(5)"), None);
         assert_eq!(ir.ir_type, IRType::Char { length: 5 });
         let ir = TrinoSyncAdapter.column_to_ir(&col("d", "decimal(12,3)"), None);
-        assert_eq!(ir.ir_type, IRType::Decimal { precision: 12, scale: 3 });
+        assert_eq!(
+            ir.ir_type,
+            IRType::Decimal {
+                precision: 12,
+                scale: 3
+            }
+        );
         let ir = TrinoSyncAdapter.column_to_ir(&col("t", "time with time zone"), None);
-        assert_eq!(ir.ir_type, IRType::Time { with_timezone: true });
+        assert_eq!(
+            ir.ir_type,
+            IRType::Time {
+                with_timezone: true
+            }
+        );
         let ir = TrinoSyncAdapter.column_to_ir(&col("m", "map(varchar, integer)"), None);
         assert_eq!(ir.ir_type, IRType::Json);
         let ir = TrinoSyncAdapter.column_to_ir(&col("r", "row(x integer)"), None);
@@ -248,35 +282,62 @@ mod tests {
     fn trino_target_native_edge_cases() {
         let a = TrinoSyncAdapter;
         assert_eq!(a.ir_type_to_native(&IRType::Int8), "tinyint");
-        assert_eq!(a.ir_type_to_native(&IRType::Decimal { precision: 0, scale: 0 }), "decimal");
-        assert_eq!(a.ir_type_to_native(&IRType::Char { length: 10 }), "char(10)");
+        assert_eq!(
+            a.ir_type_to_native(&IRType::Decimal {
+                precision: 0,
+                scale: 0
+            }),
+            "decimal"
+        );
+        assert_eq!(
+            a.ir_type_to_native(&IRType::Char { length: 10 }),
+            "char(10)"
+        );
         assert_eq!(
             a.ir_type_to_native(&IRType::Varchar { length: Some(200) }),
             "varchar(200)"
         );
         assert_eq!(
-            a.ir_type_to_native(&IRType::Time { with_timezone: false }),
+            a.ir_type_to_native(&IRType::Time {
+                with_timezone: false
+            }),
             "time"
         );
         assert_eq!(
-            a.ir_type_to_native(&IRType::Timestamp { with_timezone: false }),
+            a.ir_type_to_native(&IRType::Timestamp {
+                with_timezone: false
+            }),
             "timestamp"
         );
         assert_eq!(a.ir_type_to_native(&IRType::Bit { length: 1 }), "boolean");
-        assert_eq!(a.ir_type_to_native(&IRType::Other("custom".into())), "varchar");
+        assert_eq!(
+            a.ir_type_to_native(&IRType::Other("custom".into())),
+            "varchar"
+        );
     }
 
     #[test]
     fn trino_format_literal() {
         let a = TrinoSyncAdapter;
         assert_eq!(a.format_literal(&None, &IRType::Text), "NULL");
-        assert_eq!(a.format_literal(&Some(Value::Bool(true)), &IRType::Bool), "TRUE");
         assert_eq!(
-            a.format_literal(&Some(Value::Timestamp("2024-01-01".into())), &IRType::Timestamp { with_timezone: false }),
+            a.format_literal(&Some(Value::Bool(true)), &IRType::Bool),
+            "TRUE"
+        );
+        assert_eq!(
+            a.format_literal(
+                &Some(Value::Timestamp("2024-01-01".into())),
+                &IRType::Timestamp {
+                    with_timezone: false
+                }
+            ),
             "TIMESTAMP '2024-01-01'"
         );
         assert_eq!(
-            a.format_literal(&Some(Value::Json(serde_json::json!({"a":1}))), &IRType::Json),
+            a.format_literal(
+                &Some(Value::Json(serde_json::json!({"a":1}))),
+                &IRType::Json
+            ),
             "JSON '{\"a\":1}'"
         );
         assert_eq!(
